@@ -1,11 +1,11 @@
 import json
 from fastapi import APIRouter,Depends,Response
 from ..config.database import get_db
-from ..schemas.evidence import EvidenceOutput
+from ..schemas.evidence import EvidenceOutput,EvidenceSummary
 from ..services.auth import current_user
 from ..services.evidence import list_evidence,get_evidence
 router=APIRouter(prefix='/evidence')
-@router.get('',response_model=list[EvidenceOutput])
+@router.get('',response_model=list[EvidenceSummary])
 def listing(db=Depends(get_db),user=Depends(current_user)):return list_evidence(db)
 @router.get('/{batch_id}',response_model=EvidenceOutput)
 def detail(batch_id:int,db=Depends(get_db),user=Depends(current_user)):return get_evidence(db,batch_id)

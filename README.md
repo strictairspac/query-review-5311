@@ -8,10 +8,10 @@
 
 ## 业务模块
 
-1. 样本库：登记名称、口径说明与原始 SELECT，防止重名；提供温控合格、路线费用、异常温控三个起始样本。
-2. SQL 复核：选择基准，编辑候选，校验后创建独立批次并入 Redis 队列。
-3. 运行历史：跟踪 queued/running/passed/different/failed，失败也保留证据。
-4. 证据详情：真实 EXPLAIN ANALYZE、两侧结果行、SHA-256 摘要、遗漏/新增行和 JSON 下载。
+1. 样本库：登记名称、口径说明与原始 SELECT，防止重名；提供温控合格、逐笔运费对账、路线费用、异常温控四个起始样本（逐笔样本用于无单号对账）。
+2. SQL 复核：选择基准，编辑候选，选择复核方式（精确比对或无单号对账），校验后创建独立批次并入 Redis 队列。
+3. 运行历史：跟踪 queued/running/passed/different/pending_claim/failed，失败也保留证据。
+4. 证据详情：真实 EXPLAIN ANALYZE、两侧结果行、SHA-256 摘要、遗漏/新增行和 JSON 下载；无单号批次可在此认领配对。
 5. 管理员操作审计：记录写请求、执行账号和 HTTP 结果，包括拒绝请求。
 
 | 角色 | 主要页面 | 权限与典型动作 |
@@ -47,8 +47,10 @@ docker compose down -v --remove-orphans
 4. 09:15 提交到 worker，在运行历史刷新查看状态。
 5. 09:20 打开证据，确认两侧均为 3 行、摘要相同、结果一致；展开真实计划比较循环次数与代价。
 6. 09:25 把候选条件改为 `temperature > 8`，用新批次执行并查看新增/遗漏行。
-7. 09:30 下载 `review-<批次号>.json` 给结算复核人。
-8. 09:40 viewer 登录复核，API 创建样本返回 403；10:00 admin 查看审计。
+7. 09:30 选择“逐笔运费对账”样本与“无单号对账”方式，提交候选；在证据页确认待认领的多解配法。
+8. 09:32 勾选一对配对提交认领；若与同事的认领合并后无解，页面提示重选，已入库的依据保留。
+9. 09:35 下载 `review-<批次号>.json` 给结算复核人。
+10. 09:40 viewer 登录复核，API 创建样本返回 403；10:00 admin 查看审计。
 
 ```sql
 SELECT customer, SUM(amount) AS total
@@ -67,6 +69,24 @@ ORDER BY customer
 
 失败态包括语法/白名单失败（提交前 422）、缺少样本（404）、重名（409）、任务配额（429）、数据库超时/运行错误（批次 failed，保存 error）。正常差异是 different，不当成异常。
 
+### 无单号对账
+
+发起复核时可选择“无单号对账”。两侧结算行按**同客户、同线路且金额相差不超过 0.01** 一对一配对；同值重复行各占一份，但同值行互换不算另一种配法。配对要求使用结果列名 `customer`、`route`、`amount`（各恰好一列），缺列或金额非数字时该批次的精确比对照常保存，无单号结论标记为执行失败并给出原因。
+
+- 全配存在且配法唯一 → `passed`；
+- 全配不存在 → `different`，不可认领；
+- 存在两种及以上配法 → `pending_claim`，页面列出可认领的“金额类别对”。
+
+算法不做“最近金额”贪心：单个客户/线路组内若存在全配，按金额排序的同序配对一定可行（一维容差的非交叉性质），因此贪心挑最近会漏配的情形不会被误判。多解判定在“金额类别流量”的残量网络上判断：存在长度 ≥4 的交替环即还有另一种配法；同值类别的互换不产生环。原型已用穷举全排列对照随机样例验证。
+
+认领把选中的行对固定下来，后端在批次行锁内合并**全部已认领依据**后重算：
+
+- 认领可以只选一对；固定后剩余行仍须能配齐，全部唯一才转为 `passed`；
+- 两条并发认领即使各自可行，合并后也可能无解；后到的一条返回 409 并提示重选，已入库的依据不受影响；
+- 认领请求带幂等键：入库后断线重试返回原认领与结论，不会重复入库；
+- 认领依据与被固定的结论（配对、状态）写在同一张 `claims` 记录，同时生效；
+- 精确比对、原有比较方式、SHA-256 摘要和观察员只读限制均不变；观察员认领返回 403。
+
 ## 技术栈、结构与本地开发
 
 | 部分 | 实现 |
@@ -77,7 +97,7 @@ ORDER BY customer
 | db / cache | PostgreSQL 16、Redis 7 |
 | auth | JWT 8 小时有效，PBKDF2 SHA-256 加盐密码 |
 
-`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v1。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence，各自有模型、schema、服务、路由、API、store 和页面。
+`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v2。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence、claim，各自有模型、schema、服务、路由、API、store 和页面（claim 依附于批次详情页，无独立页面）。
 
 后端本地：创建虚拟环境并安装 `backend/requirements.txt`，先用 Compose 启动 db/redis，设置本地可达的 DATABASE_URL/REDIS_URL/JWT_SECRET，进入 backend 执行 `uvicorn src.main:app --reload`；worker 需 `/artifacts` 可写目录并执行 `python -m src.worker`。最省事的开发方式是修改源码后 `docker compose up -d --build`。前端通过 Nginx 的 `/api/` 去前缀代理访问后端，禁止双重 `/api/api`。
 
@@ -88,6 +108,8 @@ ORDER BY customer
 ## 已知边界
 
 - 小型工作流没有样本删除和版本编辑；新口径新建样本/批次，旧记录保持独立。
+- 无单号对账只在已复核的固定数据集上判断；不做跨客户/跨线路配对，也不按单号或时间窗对齐。
+- 认领候选按金额类别展示，同值重复行互换不视为另一种配法；批次一旦唯一配齐即关闭认领。
 - 使用固定业务数据和单实例 worker；不对接生产数据库，不部署生产高可用。
 - 只允许受限 SQL 子集；不支持 CTE、窗口、跨表联接和用户自定义函数。
 - 查询会执行两次（一次 EXPLAIN ANALYZE，一次取结果）；数据源固定只读，避免两次间口径变化。
